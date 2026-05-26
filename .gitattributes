@@ -1,0 +1,7 @@
+# Specify filepatterns you want to assign special attributes.
+
+lsync.conf export-ignore
+/modules/nvcomp.py export-ignore
+/scripts/mig export-ignore
+/plots/queries.py export-ignore
+/plots/shuffle_skew.py export-ignore
