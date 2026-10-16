@@ -29,6 +29,7 @@ from helpers.thread_pool_manager import (
     clear_thread_futures
 )
 from helpers.util import parquet_type_to_torch_dtype, to_torch_dtype
+from helpers.flowcsd_observe import first_read_begin, first_read_end
 from concurrent.futures import ThreadPoolExecutor
 import cupy as cp
 import numpy as np
@@ -329,7 +330,10 @@ class ParquetFIFOReader:
             options.set_row_groups([[rg]])
             options.set_columns(self.column_names)
             options.set_aggregate_reader_metadata(self.metadata_ptr)
+            first_read = first_read_begin() # FlowCSD observation: one-time libcudf initialization happens in the first call
             plc_table_w_meta = plc.io.parquet.read_parquet(options, th_stream)
+            if first_read:
+                first_read_end() # FlowCSD observation
             torch.cuda.nvtx.range_push(f"RG_IDX={rg_idx} {self.table_name} RG={rg} TBL")
             plc_table = plc_table_w_meta.tbl
             torch.cuda.nvtx.range_pop() 

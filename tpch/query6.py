@@ -9,6 +9,7 @@ import torch
 import torch.distributed as dist
 
 from helpers import util
+from helpers.flowcsd_observe import dump_result
 from modules.filter_module import FilterCondition, FilterOp, TableFilter
 from modules.single_thread_naive import ShuffleWithJoinNaive
 from modules.single_thread_shuffle_join_multistream import ShuffleWithJoin_MultiStream
@@ -99,6 +100,7 @@ def run_query6_on_parquet(iteration, store, target_device, scale_factor):
     if os.environ["SHUFFLE_PROBE_TYPE"] != "FULL":
         return
     ######################################################################################
+    dump_result({"revenue": query6_aggregation}) # FlowCSD observation, after the timed region
     print(f"# [Local] Result Revenue: {query6_aggregation[0]}")
     if os.environ.get("SYNC_RESULT", "False") == "True" and WORLD_SIZE > 1:
         all_revenues = [None] * WORLD_SIZE

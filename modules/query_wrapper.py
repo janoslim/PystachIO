@@ -15,6 +15,7 @@ from modules.single_node_join import SingleNodeJoin
 from modules.single_thread_naive import ShuffleWithJoinNaive
 from modules.single_thread_shuffle_join_multistream import ShuffleWithJoin_MultiStream
 from helpers.CuDFReader import CuDFReader
+from helpers.flowcsd_observe import print_query_window, reset_pool_peak
 
 import logging
 logger = logging.getLogger(__name__)
@@ -30,6 +31,8 @@ class ReaderWrapper:
     read_full_infos = list of table_name --> Tables with these names in table_infos will be read in full, other partitioned 
     """
     def __init__(self, store, target_device, *, table_infos,read_full_infos=None):
+        reset_pool_peak() # FlowCSD observation: the pool peak covers this query only
+        self.query_start_ns = time.perf_counter_ns() # FlowCSD observation: query submitted (before metadata reads)
         self.WORLD_SIZE = int(os.environ['WORLD_SIZE'])
         self.WORLD_RANK = int(os.environ['RANK'])
         self.SF = int(os.environ["TPCH_SCALE_FACTOR"])
@@ -127,6 +130,7 @@ class ReaderWrapper:
             else:
                 join_all_threads() # or join all readers
         end = time.perf_counter_ns()
+        print_query_window(self.query_start_ns, start, end) # FlowCSD observation, after the timed region
 
         if use_cudf_native_reader:
             # Simplified metrics for CuDFReader

@@ -157,4 +157,7 @@ if __name__ == "__main__":
         if dist.is_initialized():
             dist.destroy_process_group()
         beemon.stop()
+    # FlowCSD observation: os._exit skips CUDA's exit handlers, so a profiler (nsys/CUPTI) never gets its
+    # trace buffers flushed; cudaProfilerStop flushes them. Without a profiler it does nothing.
+    torch.cuda.profiler.stop()
     os._exit(0)
