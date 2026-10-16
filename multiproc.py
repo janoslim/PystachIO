@@ -35,7 +35,10 @@ GPU_2_SSD_MAPPING = {gpu: "" for gpu in gpu_devices}
 for gpu,nvme in GPU_2_NVME_MAPPING.items():
     GPU_2_SSD_MAPPING[gpu] = topo.get_nvme_mount(nvme)
 
-if len(GPU_2_NIC_MAPPING) != len(gpu_devices):
+# d703 port (FlowCSD): a single-GPU run sends nothing over the network, so a host without an RDMA NIC
+# (no NIC in `nvidia-smi topo -m`, no ibdev2netdev) runs with NCCL's default interface choice.
+SINGLE_GPU_WITHOUT_NIC = num_progs == 1 and not GPU_2_NIC_MAPPING
+if len(GPU_2_NIC_MAPPING) != len(gpu_devices) and not SINGLE_GPU_WITHOUT_NIC:
     sys.exit(f"No complete GPU-NIC mapping:\n{GPU_2_NIC_MAPPING}")
 if len(GPU_2_SSD_MAPPING) != len(gpu_devices):
     sys.exit(f"No complete GPU-SSD mapping:\n{GPU_2_SSD_MAPPING}")
@@ -54,12 +57,16 @@ if cur_env.get("MULTI_SSD_READER", "False") != "False": # could also be numbers 
     if len(gpu_devices) > 1:
         sys.exit("ERROR: MULTI_SSD_READER=True only makes sense for single GPU setups!")
 
-# for ib_write_bw: set IB_MASTER_IP to ip of first device and NIC
-_,IB_MASTER_IP = topo.get_nic_info(GPU_2_NIC_MAPPING[gpu_devices[0]])
-cur_env["IB_MASTER_IP"] = IB_MASTER_IP
+if SINGLE_GPU_WITHOUT_NIC:
+    cur_env["IB_MASTER_IP"] = cur_env["MASTER_ADDR"]
+    cur_env["LIST_OF_NCCL_IB_HCA"] = "="
+else:
+    # for ib_write_bw: set IB_MASTER_IP to ip of first device and NIC
+    _,IB_MASTER_IP = topo.get_nic_info(GPU_2_NIC_MAPPING[gpu_devices[0]])
+    cur_env["IB_MASTER_IP"] = IB_MASTER_IP
+    cur_env["LIST_OF_NCCL_IB_HCA"] = "=" + ",".join([GPU_2_NIC_MAPPING[gpu_id] for gpu_id in gpu_devices])
 # for nccl-tests: NCCL_IB_HCA is set to one GPU/NIC, put all GPU/NICs into custom var
 cur_env["LIST_OF_CUDA_VISIBLE_DEVICES"] = ",".join([gpu_id for gpu_id in gpu_devices])
-cur_env["LIST_OF_NCCL_IB_HCA"] = "=" + ",".join([GPU_2_NIC_MAPPING[gpu_id] for gpu_id in gpu_devices])
 
 total_nodes = int(cur_env.get("TOTAL_NODES",num_progs))
 node_offset = int(cur_env.get("NODE_OFFSET",0))
@@ -72,15 +79,18 @@ for p in range(num_progs):
     outfiles[-1].flush()
 for p in range(num_progs):
     cur_env["CUDA_VISIBLE_DEVICES"] = gpu_devices[p]
-    ibdev_name = GPU_2_NIC_MAPPING[gpu_devices[p]]
-    netdev_name,_ = topo.get_nic_info(ibdev_name)
-    cur_env["NCCL_IB_HCA"] = "="+ibdev_name
-    cur_env["NCCL_SOCKET_IFNAME"] = "="+netdev_name
+    if SINGLE_GPU_WITHOUT_NIC:
+        ibdev_name, netdev_name = "none", "none"
+    else:
+        ibdev_name = GPU_2_NIC_MAPPING[gpu_devices[p]]
+        netdev_name,_ = topo.get_nic_info(ibdev_name)
+        cur_env["NCCL_IB_HCA"] = "="+ibdev_name
+        cur_env["NCCL_SOCKET_IFNAME"] = "="+netdev_name
     cur_env["STORAGE_BASE_PATH"] = GPU_2_SSD_MAPPING[gpu_devices[p]] + cur_env["STORAGE_SPECIAL_PATH"]
     # cur_env["GLOO_SOCKET_IFNAME"] = "="+netdev_name
 
     # Simple logging for sanity check once NIC failes, see issue: https://github.com/nboeschen/pytorchio/issues/18
-    outfiles[p].write(f"####### GPU: {cur_env['CUDA_VISIBLE_DEVICES']}, SSD: {GPU_2_SSD_MAPPING[gpu_devices[p]]}, IB_DEV: {ibdev_name}, NET_DEV: {netdev_name}, NCCL_IB_HCA: {cur_env['NCCL_IB_HCA']}, NCCL_SOCKET_IFNAME: {cur_env['NCCL_SOCKET_IFNAME']}\n")
+    outfiles[p].write(f"####### GPU: {cur_env['CUDA_VISIBLE_DEVICES']}, SSD: {GPU_2_SSD_MAPPING[gpu_devices[p]]}, IB_DEV: {ibdev_name}, NET_DEV: {netdev_name}, NCCL_IB_HCA: {cur_env.get('NCCL_IB_HCA')}, NCCL_SOCKET_IFNAME: {cur_env.get('NCCL_SOCKET_IFNAME')}\n")
     outfiles[p].flush()
 
     # if p == 0:
