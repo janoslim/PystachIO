@@ -68,7 +68,7 @@ def apply_defaults():
     cur_env.setdefault("BMON_TIME", "50")
     
     cur_env.setdefault("NUM_REPEATS","3")
-    cur_env.setdefault("SHUFFLE_TYPE", "OVERLAPPED") # [BLOCKING,OVERLAPPED,OVERLAPPED_GROUPS]
+    cur_env.setdefault("SHUFFLE_TYPE", "OVERLAPPED") # [BLOCKING,OVERLAPPED,OVERLAPPED_GROUPS,GRACE] GRACE = SSD spill mode (patch 0003)
     cur_env.setdefault("SHUFFLE_STREAMS", "2")
     cur_env.setdefault("SHUFFLE_SEND_TYPE", "SEND_PER_RANK") # [SEND_PER_RANK, COMB_SEND]
     cur_env.setdefault("SHUFFLE_RECV_TYPE", "RECV_PER_RANK") # [RECV_PER_RANK, COMB_RECV] # COMB_RECV is not benefitial for in-memory raw shuffle performance!
@@ -93,7 +93,16 @@ def apply_defaults():
     cur_env.setdefault("PRUNING_FLAG", "False") 
     cur_env.setdefault("READER_SEQUENTIAL", "False")   # [AblationStudy] With this, each reader owns the thread pool explicitly, not sharing. So the reading bandwidth is not high.
     cur_env.setdefault("MULTI_SSD_READER", "False") # reader experiment: 1 GPU, >1 SSD
-    cur_env.setdefault("FIFO_QUEUE_MAX_PERCENTAGE", "100") # This only works with storage and network overlapping
+    # Spill tree (patch 0003): a byte budget per reader replaces FIFO_QUEUE_MAX_PERCENTAGE; row groups are submitted
+    # with credits so that at most this many decoded bytes per table are read ahead of the plan (Parquet_FIFO.py).
+    cur_env.setdefault("FIFO_QUEUE_MAX_BYTES", str(256 * 1024 * 1024))
+
+    # SSD spill (SHUFFLE_TYPE=GRACE, patch 0003; run_query.sh --mode grace-spill sets them)
+    cur_env.setdefault("SPILL_PARTITIONS", "0") # partitions of every spilling operator (spill_partitions.csv); 0 = the query has none
+    cur_env.setdefault("SPILL_RESIDENT_PARTITIONS", "0") # k: partitions 0..k-1 stay in GPU memory (hybrid; spill_partitions.csv); the join keeps at most k, as many as fit
+    cur_env.setdefault("SPILL_PARTITION_BUDGET_BYTES", str(4 * 1024 * 1024 * 1024)) # GPU state of one partition (join build or group-by finalize)
+    cur_env.setdefault("SPILL_DIR_LINEITEM", "") # per-run directory (or ':'-separated, striped) for lineitem-derived partitions
+    cur_env.setdefault("SPILL_DIR_OTHER_TABLES", "") # same for partitions derived from the other tables
     
     # CUDF
     cur_env.setdefault("KVIKIO_COMPAT_MODE", "OFF")

@@ -66,12 +66,14 @@ class TensorMorsel:
 
 # One FIFO per table, with some columns specified
 class FIFO(torch.nn.Module):
-    def __init__(self, parent, num_producers: int, table_name: str = "table", columns: List[str] = None, maxsize: int = 0):
+    def __init__(self, parent, num_producers: int, table_name: str = "table", columns: List[str] = None, maxsize: int = 0,
+                 on_dequeue=None):
         """
         Args:
             table_name: in str
             columns: in str
             maxsize: Maximum queue size (0 = unlimited)
+            on_dequeue: called after every dequeued morsel (spill tree: the reader submits its next row group)
         """
         super().__init__()
         self.parent = parent
@@ -84,6 +86,7 @@ class FIFO(torch.nn.Module):
         self._num_producers = num_producers
         self._producers_done = 0
         self._done_lock = threading.Lock()
+        self._on_dequeue = on_dequeue
     
     def put(self, morsel: TensorMorsel):
         """PUT: *blocking* enqueue a TensorMorsel (e.g. horizontal partitioning of a table)."""
@@ -110,6 +113,8 @@ class FIFO(torch.nn.Module):
                         self.parent.join()
                     return None
                 # Continue polling if not finished
+        if self._on_dequeue is not None:
+            self._on_dequeue()
         return morsel
 
     def producer_finish(self):

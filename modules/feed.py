@@ -30,6 +30,11 @@ class Feed(nn.Module):
                 if len(data) > 0:
                     self.seen_tuples += data[0].shape[0]
                 probe_pipeline(data)
+                # Spill tree (patch 0003): data may be a reader-FIFO morsel allocated on a reader thread's stream. Once
+                # it is dropped, cudaMallocAsync can hand its blocks to a reader's next decode while the pipeline's
+                # kernels still read them; the credit reader keeps readers decoding during the whole query, so let
+                # the pipeline finish first.
+                self._stream.synchronize()
 
         self._stream.synchronize()
         time_ns = time.perf_counter_ns()-start

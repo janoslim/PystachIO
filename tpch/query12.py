@@ -4,6 +4,7 @@ import time
 import datetime
 sys.path.append(os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')))
 import pandas as pd
+from functools import partial
 import torch
 import torch.distributed as dist
 
@@ -12,6 +13,7 @@ from helpers.flowcsd_observe import dump_result
 from modules.filter_module import FilterCondition, FilterOp, FilterOpCol, TableFilter
 from modules.single_thread_naive import ShuffleWithJoinNaive
 from modules.single_thread_shuffle_join_multistream import ShuffleWithJoin_MultiStream
+from modules.grace_join import GraceHashJoin
 
 from modules.query_wrapper import ReaderWrapper
 from modules.join_wrapper_module import join_wrapper
@@ -79,6 +81,12 @@ def run_query12_on_parquet(iteration, store, target_device, scale_factor):
         SHUFFLE_MODULE_TYPE = ShuffleWithJoinNaive
     elif "OVERLAPPED" in os.environ["SHUFFLE_TYPE"]:
         SHUFFLE_MODULE_TYPE = ShuffleWithJoin_MultiStream
+    elif os.environ["SHUFFLE_TYPE"] == "GRACE":
+        # SSD spill mode (patch 0003): each join side spills to the data SSD that does not hold the table it scans
+        # needed_columns: the joined columns query12_probe_pipeline reads (l_shipmode, o_orderpriority); only these
+        # and the keys are spilled
+        SHUFFLE_MODULE_TYPE = partial(GraceHashJoin, build_spill_dirs=os.environ["SPILL_DIR_LINEITEM"],
+                                      probe_spill_dirs=os.environ["SPILL_DIR_OTHER_TABLES"], needed_columns=[4, 6])
     else:
         print(f"Error, unknown SHUFFLE_TYPE={os.environ["SHUFFLE_TYPE"]}")
         return

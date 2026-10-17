@@ -4,6 +4,7 @@ import time
 import datetime
 sys.path.append(os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')))
 import pandas as pd
+from functools import partial
 import torch
 import torch.distributed as dist
 
@@ -12,6 +13,7 @@ from helpers.flowcsd_observe import dump_result
 from modules.filter_module import FilterCondition, FilterOp, TableFilter
 from modules.single_thread_naive import ShuffleWithJoinNaive
 from modules.single_thread_shuffle_join_multistream import ShuffleWithJoin_MultiStream
+from modules.grace_join import GraceHashJoin
 
 from modules.query_wrapper import ReaderWrapper
 from modules.join_wrapper_module import join_wrapper
@@ -68,6 +70,12 @@ def run_query10_on_parquet(iteration, store, target_device, scale_factor):
         SHUFFLE_MODULE_TYPE = ShuffleWithJoinNaive
     elif "OVERLAPPED" in os.environ["SHUFFLE_TYPE"]:
         SHUFFLE_MODULE_TYPE = ShuffleWithJoin_MultiStream
+    elif os.environ["SHUFFLE_TYPE"] == "GRACE":
+        # SSD spill mode (patch 0003): each join side spills to the data SSD that does not hold the table it scans
+        # needed_columns: the joined columns query10_probe_pipeline reads (c_custkey, c_nationkey, c_acctbal,
+        # l_extendedprice, l_discount); only these and the keys are spilled
+        SHUFFLE_MODULE_TYPE = partial(GraceHashJoin, build_spill_dirs=os.environ["SPILL_DIR_OTHER_TABLES"],
+                                      probe_spill_dirs=os.environ["SPILL_DIR_LINEITEM"], needed_columns=[0, 1, 2, 7, 8])
     else:
         print(f"Error, unknown SHUFFLE_TYPE={os.environ["SHUFFLE_TYPE"]}")
         return
@@ -133,6 +141,9 @@ def run_query10_on_parquet(iteration, store, target_device, scale_factor):
 
     co_lineitem = SHUFFLE_MODULE_TYPE(target_device, order_lineitem_hash_init, co_lineitem_left_child, 3,
                                       shuffle_right_child, 0, store, store_prefix="")
+    if os.environ["SHUFFLE_TYPE"] == "GRACE":
+        # SSD spill mode (patch 0003): nothing probes the customer join once the Grace join has drained its build side
+        co_lineitem.release_after_build_side.append(customer_orders_join)
     # joined_tuples
     # [ 0,          1,            2,          3,            4,           5,             6,           7,                8,           9]
     # ["c_custkey","c_nationkey","c_acctbal","o_orderkey", "o_custkey", "o_orderdate", "l_orderkey","l_extendedprice","l_discount","l_returnflag"]

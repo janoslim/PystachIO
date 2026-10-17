@@ -50,6 +50,10 @@ class TensorBuffer(nn.Module):
             return None
 
         result = [torch.cat(tuple(chunk[col_idx] for chunk in tensorss)) for col_idx in range(len(tensorss[0]))]
+        # Spill tree (patch 0003): the input morsels may come from a reader FIFO, allocated on reader threads' streams.
+        # Once they are dropped at return, cudaMallocAsync can hand their blocks to a reader's next decode while the
+        # cat still reads them; the credit reader keeps readers decoding during the whole query, so let it finish first.
+        torch.cuda.current_stream().synchronize()
         torch.cuda.nvtx.range_pop()
 
         return result

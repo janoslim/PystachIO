@@ -122,9 +122,16 @@ class ReaderWrapper:
                     join_all_threads()
 
         # how to join, when to call what, etc. configured in callable (e.g. see query3)
-        results = callable()
+        try:
+            results = callable()
+        except BaseException:
+            # FlowCSD observation (spill tree): a failed query still reports its spill counters; -1 = no query end
+            print_query_window(self.query_start_ns, start, -1)
+            raise
 
-        if not use_cudf_native_reader and "OVERLAPPED" in os.environ["SHUFFLE_TYPE"] and os.environ["STORAGE_BLOCKING"] != "True":
+        # GRACE (spill mode, patch 0003) reads like OVERLAPPED: the readers run while the plan consumes.
+        overlapped_reading = "OVERLAPPED" in os.environ["SHUFFLE_TYPE"] or os.environ["SHUFFLE_TYPE"] == "GRACE"
+        if not use_cudf_native_reader and overlapped_reading and os.environ["STORAGE_BLOCKING"] != "True":
             if len(self.readers) > 1 and os.environ.get("MULTI_SSD_READER", "False") != "False":
                 ParquetFIFOReader.parallel_join_all(self.readers)
             else:

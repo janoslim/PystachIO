@@ -13,6 +13,7 @@ from helpers.flowcsd_observe import dump_result
 from modules.filter_module import FilterCondition, FilterOp, TableFilter
 from modules.single_thread_naive import ShuffleWithJoinNaive
 from modules.single_thread_shuffle_join_multistream import ShuffleWithJoin_MultiStream
+from modules.grace_join import GraceHashJoin
 from modules.tensor_buffer import TensorBuffer
 from modules.query_wrapper import ReaderWrapper
 from modules.single_node_join import SingleNodeJoin
@@ -79,6 +80,12 @@ def run_query5_on_parquet(iteration, store, target_device, scale_factor):
         SHUFFLE_MODULE_TYPE = ShuffleWithJoinNaive
     elif "OVERLAPPED" in os.environ["SHUFFLE_TYPE"]:
         SHUFFLE_MODULE_TYPE = ShuffleWithJoin_MultiStream
+    elif os.environ["SHUFFLE_TYPE"] == "GRACE":
+        # SSD spill mode (patch 0003): each join side spills to the data SSD that does not hold the table it scans
+        # needed_columns: the joined columns query5_opt_probe_pipeline reads (c_nationkey, l_suppkey, l_extendedprice,
+        # l_discount); only these and the keys are spilled
+        SHUFFLE_MODULE_TYPE = partial(GraceHashJoin, build_spill_dirs=os.environ["SPILL_DIR_OTHER_TABLES"],
+                                      probe_spill_dirs=os.environ["SPILL_DIR_LINEITEM"], needed_columns=[1, 3, 4, 5])
     else:
         print(f"Error, unknown SHUFFLE_TYPE={os.environ["SHUFFLE_TYPE"]}")
         return
@@ -155,6 +162,10 @@ def run_query5_on_parquet(iteration, store, target_device, scale_factor):
     # build side: ["c_custkey","c_nationkey","o_orderkey", "o_custkey", "o_orderdate"]
     co_lineitem = SHUFFLE_MODULE_TYPE(target_device, order_lineitem_hash_init, shuffle_left_child, 2,
                                          shuffle_right_child, 0, store, store_prefix="", project_build_side=[2,1])
+    if os.environ["SHUFFLE_TYPE"] == "GRACE":
+        # SSD spill mode (patch 0003): nothing probes the customer join once the Grace join has drained its build side
+        # (last_join stays: the probe pipeline probes it)
+        co_lineitem.release_after_build_side.append(customer_orders_join)
     # before aggregation ["n_name","l_extendedprice","l_discount"]
     # query5_aggregation = AggregationPostCombine(query5_agg, query5_agg_combine, [1], projection=[11,12])
     query5_aggregation = AggregationPostCombine(query5_agg, query5_agg_combine, [0], projection=[1,2])

@@ -2,6 +2,7 @@ import threading
 import logging
 from concurrent.futures import ThreadPoolExecutor
 import os
+import ctypes
 logger = logging.getLogger(__name__)
 
 ### Global Thread Pool Management ###
@@ -12,6 +13,10 @@ THREAD_POOL_LOCK = threading.Lock()
 GLOBAL_THREAD_FUTURES = []
 GLOBAL_FUTURES_LOCK = threading.Lock()
 
+def _set_reader_thread_name():
+    """Set the Linux OS thread name (PR_SET_NAME = 15) so pidstat -t attributes reader pool CPU time."""
+    ctypes.CDLL("libc.so.6").prctl(15, b"py_reader")
+
 def get_global_thread_pool(max_workers):
     """Get or create the global thread pool with specified max workers."""
     global GLOBAL_THREAD_POOL
@@ -20,7 +25,8 @@ def get_global_thread_pool(max_workers):
         if GLOBAL_THREAD_POOL is None:
             GLOBAL_THREAD_POOL = ThreadPoolExecutor(
                 max_workers=num_threads,
-                thread_name_prefix="th" # use this as a index to streams
+                thread_name_prefix="th", # use this as a index to streams
+                initializer=_set_reader_thread_name
             )
             logger.info(f"[ThreadPoolManager] Created global thread pool with {num_threads} workers")
         else:

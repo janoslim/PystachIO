@@ -5,6 +5,7 @@ class SHUFFLE_TYPE(Enum):
     OVERLAPPED = auto()
     OVERLAPPED_GROUPS = auto()
     MIG = auto()
+    GRACE = auto()  # SSD spill mode (patch 0003): GraceHashJoin; the overlapped reader as in OVERLAPPED
 
 class SHUFFLE_PROBE_TYPE(Enum):
     MATCHES_ONLY = auto()

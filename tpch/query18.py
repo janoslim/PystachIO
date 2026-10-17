@@ -14,6 +14,7 @@ from modules.filter_module import FilterCondition, FilterOp, TableFilter
 from modules.morsel_table_module import MorselTableModule
 from modules.single_thread_naive import ShuffleWithJoinNaive
 from modules.single_thread_shuffle_join_multistream import ShuffleWithJoin_MultiStream
+from modules.spilling_aggregation import SpillingAggregation
 
 from modules.query_wrapper import ReaderWrapper
 from modules.feed import Feed
@@ -69,12 +70,18 @@ def query18_agg_combine(sorted_data,groups_unique,group_idx):
     results = torch.zeros(groups_unique.shape[0],dtype=sorted_data[1].dtype,device=sorted_data[0].get_device()).scatter_reduce(0, group_idx, sorted_data[1], reduce="sum")
     return results
 
+def query18_having(aggs):
+    # having sum(l_quantity) > 300; quantities are DECIMAL(15,2) integers (x100)
+    return aggs.gt(30000)
+
 
 def run_query18_on_parquet(iteration, store, target_device, scale_factor):
     WORLD_SIZE = int(os.environ['WORLD_SIZE'])
     if os.environ["SHUFFLE_TYPE"] == "BLOCKING":
         SHUFFLE_MODULE_TYPE = ShuffleWithJoinNaive
-    elif "OVERLAPPED" in os.environ["SHUFFLE_TYPE"]:
+    elif "OVERLAPPED" in os.environ["SHUFFLE_TYPE"] or os.environ["SHUFFLE_TYPE"] == "GRACE":
+        # GRACE (SSD spill mode, patch 0003): the join's build side is only the HAVING survivors, so it stays the
+        # shuffle join; the pre-aggregation below spills instead
         SHUFFLE_MODULE_TYPE = ShuffleWithJoin_MultiStream
     else:
         print(f"Error, unknown SHUFFLE_TYPE={os.environ["SHUFFLE_TYPE"]}")
@@ -136,7 +143,17 @@ def run_query18_on_parquet(iteration, store, target_device, scale_factor):
                                       shuffle_right_child, 1, store, store_prefix="")
 
 
-    query18_preagg_pipeline = AggregationPostCombine(query18_agg, query18_agg_combine, [0], projection=[1])
+    if os.environ["SHUFFLE_TYPE"] == "GRACE":
+        # SSD spill mode (patch 0003): the partial groups spill by l_orderkey to the data SSD without lineitem and
+        # finalize() applies the HAVING per partition, so get_results() holds only the survivors
+        query18_preagg_pipeline = SpillingAggregation(query18_agg, query18_agg_combine, [0], projection=[1],
+                                                      spill_dirs=os.environ["SPILL_DIR_LINEITEM"],
+                                                      post_filter=query18_having,
+                                                      # partial groups (l_orderkey, sum(l_quantity)) keep the dtypes
+                                                      # of the lineitem columns (l_orderkey, l_quantity)
+                                                      partial_dtypes=lineitem_reader.get_dtypes())
+    else:
+        query18_preagg_pipeline = AggregationPostCombine(query18_agg, query18_agg_combine, [0], projection=[1])
     # ["l_orderkey", "sum_quantity", "c_custkey", "o_orderkey", "o_custkey", "o_totalprice", "o_orderdate"]
     query18_probe_pipeline = AggregationPostCombine(query18_agg, query18_agg_combine, [2,3,5,6], projection=[1])
 
@@ -150,7 +167,7 @@ def run_query18_on_parquet(iteration, store, target_device, scale_factor):
         groups, aggs = query18_preagg_pipeline.get_results()
         print(f"# preagg groups: {groups.shape}")
 
-        mask = aggs.gt(30000)
+        mask = query18_having(aggs)
         groups = torch.masked_select(groups[:,0],mask)
         aggs = torch.masked_select(aggs,mask)
 

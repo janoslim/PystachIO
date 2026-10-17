@@ -56,7 +56,7 @@ def query1_agg(sorted_data,groups_unique,group_idx):
     results[:,3].scatter_reduce_(0, group_idx, sum_disc_price*(100 + sorted_data[3]), reduce="sum") # sum_charge
     results[:,4].scatter_reduce_(0, group_idx, torch.ones(group_idx.shape[0],dtype=torch.int64,device=sorted_data[0].get_device()), reduce="sum") # count_order
 
-    return results
+    return results.to(torch.float64)
 
 def query1_agg_combine(sorted_data,groups_unique,group_idx):
     results = torch.zeros((groups_unique.shape[0],5),dtype=sorted_data[1].dtype,device=sorted_data[0].get_device())
@@ -73,7 +73,8 @@ def run_query1_on_parquet(iteration, store, target_device, scale_factor):
     WORLD_SIZE = int(os.environ['WORLD_SIZE'])
     if os.environ["SHUFFLE_TYPE"] == "BLOCKING":
         SHUFFLE_MODULE_TYPE = ShuffleWithJoinNaive
-    elif "OVERLAPPED" in os.environ["SHUFFLE_TYPE"]:
+    elif "OVERLAPPED" in os.environ["SHUFFLE_TYPE"] or os.environ["SHUFFLE_TYPE"] == "GRACE":
+        # GRACE (SSD spill mode, patch 0003): Q1 has no join; only the spill tree's bounded reader queue applies
         SHUFFLE_MODULE_TYPE = ShuffleWithJoin_MultiStream
     else:
         print(f"Error, unknown SHUFFLE_TYPE={os.environ["SHUFFLE_TYPE"]}")

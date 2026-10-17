@@ -83,6 +83,10 @@ class SingleNodeJoin(nn.Module):
             return [torch.empty(0, dtype=dtype, device=right_data[0].get_device()) for dtype in self.get_dtypes()]
 
         result = [torch.cat(tuple(chunk[col_idx] for chunk in all_chunks)) for col_idx in range(len(all_chunks[0]))]
+        # Spill tree (patch 0003): right_data may be a reader-FIFO morsel allocated on a reader thread's stream. Once it
+        # is dropped, cudaMallocAsync can hand its blocks to a reader's next decode while the probe gathers still read
+        # them; the credit reader keeps readers decoding during the whole query, so let the gathers finish first.
+        torch.cuda.current_stream().synchronize()
         torch.cuda.nvtx.range_pop()
 
         return result
@@ -134,6 +138,10 @@ class SingleNodeJoin(nn.Module):
             for col_idx in range(len(self._left_dtypes)):
                 self.build_side_cols.append(torch.cat(tuple(buffer[col_idx] for buffer in build_side_cols_list)))
             self.build_side_tuples = self.build_side_cols[0].shape[0]
+            # Spill tree (patch 0003): the build morsels may come from a reader FIFO, allocated on reader threads'
+            # streams. Once they are dropped at return, cudaMallocAsync can hand their blocks to a reader's next
+            # decode while the cat above still reads them, so let it finish first.
+            self._stream.synchronize()
 
             # build_side_cols_list = [] # empty
             # left_hash_list = [] # empty
@@ -149,6 +157,13 @@ class SingleNodeJoin(nn.Module):
             TODO: Fix misnomer, call finish_build
         """
         self._stream.synchronize()
+
+    def release(self):
+        """Spill tree (patch 0003): free the hash tables and build columns once nothing probes this join any more
+        (GraceHashJoin.release_after_build_side). The last probes ran on the current stream: wait for them first."""
+        torch.cuda.current_stream().synchronize()
+        self.hash_tables = []
+        self.build_side_cols = []
 
     def probe(self, probe_side_cols, right_index):
         left_index_col = self.build_side_cols[self.left_index]

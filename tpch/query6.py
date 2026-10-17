@@ -50,7 +50,7 @@ def run_query6_on_parquet(iteration, store, target_device, scale_factor):
     WORLD_SIZE = int(os.environ['WORLD_SIZE'])
     if os.environ["SHUFFLE_TYPE"] == "BLOCKING":
         SHUFFLE_MODULE_TYPE = ShuffleWithJoinNaive
-    elif "OVERLAPPED" in os.environ["SHUFFLE_TYPE"]:
+    elif "OVERLAPPED" in os.environ["SHUFFLE_TYPE"] or os.environ["SHUFFLE_TYPE"] == "GRACE":
         SHUFFLE_MODULE_TYPE = ShuffleWithJoin_MultiStream
     else:
         print(f"Error, unknown SHUFFLE_TYPE={os.environ["SHUFFLE_TYPE"]}")
