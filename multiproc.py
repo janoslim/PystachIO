@@ -27,13 +27,20 @@ num_progs = int(sys.argv[2])
 with_nsys = len(sys.argv) >= 4
 
 gpu_devices = list(topo.get_devices())[:num_progs]
-GPU_2_NIC_MAPPING = topo.assign_to_gpus(gpu_devices,"-m", topo.GPU_CON.PHB)
-GPU_2_NVME_MAPPING = topo.assign_to_gpus(gpu_devices,"-nvme", topo.GPU_CON.PXB)
-# set a default empty ssd path for all SSDs. This makes it possible to run with a single SSD,
-# by using STORAGE_SPECIAL_PATH (set to e.g., "/home/pystachio/tpch")
-GPU_2_SSD_MAPPING = {gpu: "" for gpu in gpu_devices}
-for gpu,nvme in GPU_2_NVME_MAPPING.items():
-    GPU_2_SSD_MAPPING[gpu] = topo.get_nvme_mount(nvme)
+# mango port (FlowCSD): a single-GPU run reads only STORAGE_SPECIAL_PATH and sends nothing over the network, so it
+# skips the topology-based NIC and SSD assignment. On mango the GPU's PCIe switch also holds RDMA NICs and NVMe
+# drives without data, which the assignment would pick (its SSD path would then be "<lsblk column>/" + the view).
+if num_progs == 1:
+    GPU_2_NIC_MAPPING = {}
+    GPU_2_SSD_MAPPING = {gpu: "" for gpu in gpu_devices}
+else:
+    GPU_2_NIC_MAPPING = topo.assign_to_gpus(gpu_devices,"-m", topo.GPU_CON.PHB)
+    GPU_2_NVME_MAPPING = topo.assign_to_gpus(gpu_devices,"-nvme", topo.GPU_CON.PXB)
+    # set a default empty ssd path for all SSDs. This makes it possible to run with a single SSD,
+    # by using STORAGE_SPECIAL_PATH (set to e.g., "/home/pystachio/tpch")
+    GPU_2_SSD_MAPPING = {gpu: "" for gpu in gpu_devices}
+    for gpu,nvme in GPU_2_NVME_MAPPING.items():
+        GPU_2_SSD_MAPPING[gpu] = topo.get_nvme_mount(nvme)
 
 # d703 port (FlowCSD): a single-GPU run sends nothing over the network, so a host without an RDMA NIC
 # (no NIC in `nvidia-smi topo -m`, no ibdev2netdev) runs with NCCL's default interface choice.
