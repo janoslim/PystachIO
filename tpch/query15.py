@@ -152,7 +152,10 @@ def run_query15_on_parquet(iteration, store, target_device, scale_factor):
         supplier_join.build(MorselTableModule([best_suppkeys,max_local_revenue], (1<<31)), 0)
         supplier_join.finish()
 
-        result = supplier_feed(probe_pipeline=query15_final_pipeline)
+        result2 = supplier_feed(probe_pipeline=query15_final_pipeline)
+        result["time_ns"] += result2["time_ns"]
+        if isinstance(result.get("shuffled_bytes"), int):
+            result["shuffled_bytes"] = (0, 0)
 
         return result
 
@@ -166,6 +169,9 @@ def run_query15_on_parquet(iteration, store, target_device, scale_factor):
         return
     ######################################################################################
     groups, aggs = query15_probe_pipeline.get_results()
+    from helpers.flowcsd_observe import dump_result
+    idx = torch.argmax(aggs)
+    dump_result({"s_suppkey": torch.reshape(groups[idx, 0], (-1,)), "total_revenue": torch.reshape(aggs[idx], (-1,))})
     torch.set_printoptions(linewidth=200,precision=4,sci_mode=False)
     print(f"# [Local] Result groups: {groups.shape=}")
     print("# l_suppkey (first 5)    : ",groups[:5])

@@ -167,6 +167,8 @@ def run_query4_on_parquet(iteration, store, target_device, scale_factor):
 
     ######################################################################################
     groups, aggs = query4_probe_pipeline.get_results()
+    from helpers.flowcsd_observe import dump_result
+    dump_result({"groups": groups, "aggs": aggs})
 
     torch.set_printoptions(linewidth=200,precision=4,sci_mode=False)
     print(f"# [Local] Result groups: {groups.shape=}")

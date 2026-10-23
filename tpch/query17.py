@@ -183,6 +183,8 @@ def run_query17_on_parquet(iteration, store, target_device, scale_factor):
     ######################################################################################
     #######################################################################################
     groups, aggs = query17_probe_pipeline.get_results()
+    from helpers.flowcsd_observe import dump_result
+    dump_result({"sum_price": query17_final_aggregation})
     print(f"# [Local] First Result groups: {groups.shape=}")
     print("# l_partkey      :", groups[:5,0])
     print("# sum(l_quantity):", aggs[:5,0])

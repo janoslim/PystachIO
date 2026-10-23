@@ -56,7 +56,7 @@ group by
 
 def query11_agg(sorted_data,groups_unique,group_idx):
     prod = sorted_data[0] * sorted_data[1]
-    results = torch.zeros(groups_unique.shape[0],dtype=sorted_data[0].dtype,device=sorted_data[0].get_device()).scatter_reduce(0, group_idx, prod, reduce="sum", include_self=False)
+    results = torch.zeros(groups_unique.shape[0],dtype=prod.dtype,device=sorted_data[0].get_device()).scatter_reduce(0, group_idx, prod, reduce="sum", include_self=False)
     return results
 
 def query11_agg_combine(sorted_data,groups_unique,group_idx):
@@ -168,14 +168,17 @@ def run_query11_on_parquet(iteration, store, target_device, scale_factor):
         query11_second_aggregation.finalize()
         partkey, sum_pscost = query11_second_aggregation.get_results()
         mask = torch.gt(sum_pscost, torch.div(query11_aggregation,10000,rounding_mode='floor').item())
-        as_indices = mask.nonzero().squeeze()
+        as_indices = mask.nonzero().reshape(-1)
 
         after_having = torch.index_select(partkey,0,as_indices)
-        # query 11 is empty at e.g. sf 100
+        after_having_val = torch.index_select(sum_pscost,0,as_indices)
         torch.cuda.synchronize(device=target_device)
+        from helpers.flowcsd_observe import dump_result
+        dump_result({"ps_partkey": after_having[:, 0], "value": after_having_val})
         print(f"# After having shape: {after_having.shape}, first five: {after_having[:5]}")
 
-        combined_result = {k: result.get(k, 0) + result2.get(k, 0) for k in set(result) | set(result2)}
+        combined_result = {k: result.get(k, 0) + result2.get(k, 0) for k in set(result) | set(result2) if k != "shuffled_bytes"}
+        combined_result["shuffled_bytes"] = (0, 0)
         return combined_result
 
     result_str = reader_wrapper.run(tmp_function)
