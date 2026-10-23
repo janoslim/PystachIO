@@ -85,6 +85,9 @@ class ParquetFIFOReader:
         self.end_time = None
 
         ### Parquet metadata (single file or multi-part directory) ###
+        # Emit NVTX metadata scope so pyarrow.parquet.read_metadata and row-group pruning
+        # in ParquetFIFOReader.__init__ are attributed to Stage 5 (CPU Metadata) rather than Else.
+        torch.cuda.nvtx.range_push("pystachio::metadata::read_and_prune")
         self.parquet_files = resolve_parquet_files(self.parquet_file)
         part_infos = []
         total_meta_ns = 0
@@ -158,6 +161,7 @@ class ParquetFIFOReader:
                 random.shuffle(self.rank_rowgroups)
             self.rank_num_rowgroups = len(self.rank_rowgroups)
         logger.info(f"[ParquetFIFOReader] [Table {self.table_name}] Rank {self.world_rank} will create {self.rank_num_rowgroups} futures (one per RG) for dynamic work distribution: {self.rank_rowgroups}")
+        torch.cuda.nvtx.range_pop()
         self.thread_pool = get_global_thread_pool(self.num_threads)
         prepare_timer_end = time.perf_counter_ns()
         self.prepare_time = prepare_timer_end - prepare_timer_start
@@ -165,6 +169,7 @@ class ParquetFIFOReader:
         logger.info(f"[ParquetFIFOReader] [Table {self.table_name}] Prepare Time (pruning, syncing, logging, partitioning, thread-pool, stream-pool): {(prepare_timer_end - prepare_timer_start) / 1_000_000:.2f} ms")
         
         ### Decimal & StorageSize 
+        torch.cuda.nvtx.range_push("pystachio::metadata::column_stats")
         self.column_schema = {}
         self.is_decimal = {}
         self.storage_bytes = {} # col_name -> [actual bytes, uncompressed bytes, after filter bytes, file actual bytes, file uncompressed bytes] 
@@ -198,6 +203,7 @@ class ParquetFIFOReader:
                 col_file_uncompressed_bytes += self.dtypes[-1].itemsize * row_group.num_rows
             self.storage_bytes[col_name] = [col_storage_bytes, col_uncompressed_bytes, 0, col_file_actual_bytes, col_file_uncompressed_bytes] # 0 in filtered bytes we can know yet
         
+        torch.cuda.nvtx.range_pop()
         logger.info(f"[ParquetFIFOReader] table={self.table_name} file={self.parquet_file} parts={len(self.parquet_files)}")
         logger.info(f"                    [GLOBAL] total_rowgroups={len(self.rg_sources)} threads={self.num_threads} columns={self.column_names}")
         logger.info(f"                    world_rank={self.world_rank}, world_size={self.world_size}")
