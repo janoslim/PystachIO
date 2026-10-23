@@ -14,6 +14,7 @@ from rmm.pylibrmm.stream import Stream, DEFAULT_STREAM, PER_THREAD_DEFAULT_STREA
 import cupy
 import threading
 import pyarrow.parquet as pq
+import itertools
 import logging
 import os
 import humanize
@@ -45,6 +46,22 @@ def logger_setup():
     logging.basicConfig(level=storage_logging_level, format='%(asctime)s - %(levelname)s: %(message)s')
     logger.info(f"Logging level set to {storage_logging_level}")
 
+def resolve_parquet_files(parquet_file: str) -> list[str]:
+    """Resolve a single Parquet file, a directory of *.parquet part files, or a <table>.parquet path
+    whose sibling directory <table>/ holds <table>-*.parquet part files."""
+    if os.path.isdir(parquet_file):
+        files = sorted(os.path.join(parquet_file, f) for f in os.listdir(parquet_file) if f.endswith(".parquet"))
+        if files:
+            return files
+    stem_dir = parquet_file[:-8] if parquet_file.endswith(".parquet") else parquet_file
+    if os.path.isdir(stem_dir):
+        files = sorted(os.path.join(stem_dir, f) for f in os.listdir(stem_dir) if f.endswith(".parquet"))
+        if files:
+            return files
+    if os.path.isfile(parquet_file):
+        return [parquet_file]
+    raise FileNotFoundError(f"No Parquet file(s) found for {parquet_file}")
+
 class ParquetFIFOReader:
     def __init__(self, parquet_file: str, table_name: str, column_names: list[str], num_threads: int = 1,
                  world_rank: int = 0, world_size: int = 1, table_filter: TableFilter=None, next_reader=None, beemon: Beemon = None, full_read_mode: bool = False, prune_flag: bool = True):
@@ -67,43 +84,64 @@ class ParquetFIFOReader:
         self.start_time = None
         self.end_time = None
 
-        ### Parquet metadata ###
-        ###   CUDF metadata
-        if self.parquet_file in CUDF_PARQUET_METADATA_CACHE:
-            logger.info(f"[ParquetFIFOReader] Using cached metadata for {self.parquet_file}")
-            self.meta,_ = CUDF_PARQUET_METADATA_CACHE[self.parquet_file]
-        else:
-            logger.info(f"[ParquetFIFOReader] Reading and caching metadata for {self.parquet_file}")
-            tmpstart = time.perf_counter_ns()
-            self.meta = plc.io.parquet_metadata.read_parquet_metadata(plc.io.SourceInfo([self.parquet_file]))
-            tmpend = time.perf_counter_ns()
-            CUDF_PARQUET_METADATA_CACHE[self.parquet_file] = (self.meta, tmpend-tmpstart)
-        self.metadata_ptr = None 
-        self.metadata_ptr = self.meta.get_aggregate_reader_metadata_ptr() # metadata caching
-        ###   PyArrow metadata
-        if self.parquet_file in PYARROW_PARQUET_METADATA_CACHE:
-            logger.info(f"[ParquetFIFOReader] Using pyarrow cached metadata for {self.parquet_file}")
-            pq_metadata = PYARROW_PARQUET_METADATA_CACHE[self.parquet_file]
-        else:
-            logger.info(f"[ParquetFIFOReader] Reading and caching pyarrow metadata for {self.parquet_file}")
-            pq_metadata = pq.read_metadata(self.parquet_file)
-            PYARROW_PARQUET_METADATA_CACHE[self.parquet_file] = pq_metadata
+        ### Parquet metadata (single file or multi-part directory) ###
+        self.parquet_files = resolve_parquet_files(self.parquet_file)
+        part_infos = []
+        total_meta_ns = 0
+        for part_file in self.parquet_files:
+            if part_file in CUDF_PARQUET_METADATA_CACHE:
+                logger.info(f"[ParquetFIFOReader] Using cached metadata for {part_file}")
+                part_meta, part_meta_ns = CUDF_PARQUET_METADATA_CACHE[part_file]
+            else:
+                logger.info(f"[ParquetFIFOReader] Reading and caching metadata for {part_file}")
+                tmpstart = time.perf_counter_ns()
+                part_meta = plc.io.parquet_metadata.read_parquet_metadata(plc.io.SourceInfo([part_file]))
+                tmpend = time.perf_counter_ns()
+                part_meta_ns = tmpend - tmpstart
+                CUDF_PARQUET_METADATA_CACHE[part_file] = (part_meta, part_meta_ns)
+            total_meta_ns += part_meta_ns
+            part_meta_ptr = part_meta.get_aggregate_reader_metadata_ptr()
+            if part_file in PYARROW_PARQUET_METADATA_CACHE:
+                logger.info(f"[ParquetFIFOReader] Using pyarrow cached metadata for {part_file}")
+                part_pq_meta = PYARROW_PARQUET_METADATA_CACHE[part_file]
+            else:
+                logger.info(f"[ParquetFIFOReader] Reading and caching pyarrow metadata for {part_file}")
+                part_pq_meta = pq.read_metadata(part_file)
+                PYARROW_PARQUET_METADATA_CACHE[part_file] = part_pq_meta
+            part_infos.append((part_file, part_meta_ptr, part_pq_meta))
+
+        self.meta = CUDF_PARQUET_METADATA_CACHE[self.parquet_files[0]][0]
+        CUDF_PARQUET_METADATA_CACHE[self.parquet_file] = (self.meta, total_meta_ns)
+        self.metadata_ptr = part_infos[0][1]
+        pq_metadata = part_infos[0][2]
         schema = pq_metadata.schema.to_arrow_schema()
+
+        # Interleave row groups round-robin across part files so consecutive tasks cycle across SSDs.
+        per_part_rgs = [
+            [(part_file, part_meta_ptr, part_pq_meta, local_rg) for local_rg in range(part_pq_meta.num_row_groups)]
+            for part_file, part_meta_ptr, part_pq_meta in part_infos
+        ]
+        self.rg_sources = [
+            rg_entry
+            for group in itertools.zip_longest(*per_part_rgs)
+            for rg_entry in group
+            if rg_entry is not None
+        ]
         
         prepare_timer_start = time.perf_counter_ns()
-        logger.info(f"[ParquetFIFOReader] [Table {self.table_name}] has #RG: {self.meta.num_rowgroups()}")
+        logger.info(f"[ParquetFIFOReader] [Table {self.table_name}] has #RG: {len(self.rg_sources)} across {len(self.parquet_files)} file(s)")
         if self.full_read_mode:
             # no distributed partitioning, read all RG on current rank
             logger.info(f"[ParquetFIFOReader] [Table {self.table_name}] Full read mode enabled, skipping distributed partitioning")
             pruned_rowgroups = self.prune_rowgroups(pq_metadata, schema)
-            logger.info(f"[ParquetFIFOReader] [Table {self.table_name}] Pruned {self.meta.num_rowgroups() - len(pruned_rowgroups)} row groups using {"empty-" if not self.table_filter else ""}filters, remaining: {len(pruned_rowgroups)}")
+            logger.info(f"[ParquetFIFOReader] [Table {self.table_name}] Pruned {len(self.rg_sources) - len(pruned_rowgroups)} row groups using {"empty-" if not self.table_filter else ""}filters, remaining: {len(pruned_rowgroups)}")
             self.rank_rowgroups = pruned_rowgroups
             self.rank_num_rowgroups = len(self.rank_rowgroups)
         else:
             # Pruning in master-node and broadcast to other nodes
             if self.world_rank == 0:
                 pruned_rowgroups = self.prune_rowgroups(pq_metadata, schema)
-                logger.info(f"[ParquetFIFOReader] [Table {self.table_name}] [Master] Pruned {self.meta.num_rowgroups() - len(pruned_rowgroups)} row groups using {"empty-" if not self.table_filter else ""}filters, remaining: {len(pruned_rowgroups)}")
+                logger.info(f"[ParquetFIFOReader] [Table {self.table_name}] [Master] Pruned {len(self.rg_sources) - len(pruned_rowgroups)} row groups using {"empty-" if not self.table_filter else ""}filters, remaining: {len(pruned_rowgroups)}")
                 
                 self.all_rank_partitions = {}
                 for rank in range(self.world_size):
@@ -116,7 +154,8 @@ class ParquetFIFOReader:
             ### Partitioning into nodes ###
             partition_data = self.all_rank_partitions[self.world_rank]
             self.rank_rowgroups = partition_data['rank_rowgroups']
-            random.shuffle(self.rank_rowgroups)
+            if len(self.parquet_files) == 1:
+                random.shuffle(self.rank_rowgroups)
             self.rank_num_rowgroups = len(self.rank_rowgroups)
         logger.info(f"[ParquetFIFOReader] [Table {self.table_name}] Rank {self.world_rank} will create {self.rank_num_rowgroups} futures (one per RG) for dynamic work distribution: {self.rank_rowgroups}")
         self.thread_pool = get_global_thread_pool(self.num_threads)
@@ -144,22 +183,23 @@ class ParquetFIFOReader:
             col_file_uncompressed_bytes = 0
             # Calculate storage for rank rowgroups
             for rg_idx, rg in enumerate(self.rank_rowgroups):
-                row_group = pq_metadata.row_group(rg)
+                _, _, part_pq_meta, local_rg = self.rg_sources[rg]
+                row_group = part_pq_meta.row_group(local_rg)
                 rg_column = row_group.column(col_idx)
                 assert rg_column.path_in_schema == col_name
                 col_storage_bytes += rg_column.total_compressed_size
                 col_uncompressed_bytes += self.dtypes[-1].itemsize * row_group.num_rows
-            # Calculate storage for entire file
-            for rg_idx in range(pq_metadata.num_row_groups):
-                row_group = pq_metadata.row_group(rg_idx)
+            # Calculate storage for entire table across all part files
+            for _, _, part_pq_meta, local_rg in self.rg_sources:
+                row_group = part_pq_meta.row_group(local_rg)
                 rg_column = row_group.column(col_idx)
                 assert rg_column.path_in_schema == col_name
                 col_file_actual_bytes += rg_column.total_compressed_size
                 col_file_uncompressed_bytes += self.dtypes[-1].itemsize * row_group.num_rows
             self.storage_bytes[col_name] = [col_storage_bytes, col_uncompressed_bytes, 0, col_file_actual_bytes, col_file_uncompressed_bytes] # 0 in filtered bytes we can know yet
         
-        logger.info(f"[ParquetFIFOReader] table={self.table_name} file={self.parquet_file}")
-        logger.info(f"                    [GLOBAL] total_rowgroups={self.meta.num_rowgroups()} threads={self.num_threads} columns={self.column_names}")
+        logger.info(f"[ParquetFIFOReader] table={self.table_name} file={self.parquet_file} parts={len(self.parquet_files)}")
+        logger.info(f"                    [GLOBAL] total_rowgroups={len(self.rg_sources)} threads={self.num_threads} columns={self.column_names}")
         logger.info(f"                    world_rank={self.world_rank}, world_size={self.world_size}")
         logger.info(f"                    rank_num_rowgroups={self.rank_num_rowgroups} (RG IDs: {self.rank_rowgroups})")
         logger.info(f"                    Physical types: {' | '.join([f'{col}:{meta.physical_type}' for col, meta in self.column_schema.items()])}") 
@@ -198,13 +238,13 @@ class ParquetFIFOReader:
     def prune_rowgroups(self, pq_metadata, schema) -> list[int]:
         if not self.prune_flag:
             logger.info(f"[ParquetFIFOReader] [Table {self.table_name}] Pruning disabled, skipping pruning")
-            return list(range(pq_metadata.num_row_groups))
+            return list(range(len(self.rg_sources)))
         if self.table_filter is None:
             logger.info(f"[ParquetFIFOReader] [Table {self.table_name}] No filters provided, skipping pruning")
-            return list(range(pq_metadata.num_row_groups))
+            return list(range(len(self.rg_sources)))
         remaining_rgs = [] # the returned list[int]
-        for rg_idx in range(pq_metadata.num_row_groups):
-            row_group = pq_metadata.row_group(rg_idx)
+        for rg_idx, (_, _, part_pq_meta, local_rg) in enumerate(self.rg_sources):
+            row_group = part_pq_meta.row_group(local_rg)
             should_include = True
             for column_idx, filter_list in self.table_filter.column_conditions.items():
                 # the column_idx is local in the reading list, not the index in the full table
@@ -213,7 +253,7 @@ class ParquetFIFOReader:
                 col_schema_idx = schema.get_field_index(col_name)
                 
                 # Skip pruning for decimal columns DUE TO ISSUE174 & ArrowCPP
-                column_meta = pq_metadata.schema.column(col_schema_idx)
+                column_meta = part_pq_meta.schema.column(col_schema_idx)
                 if column_meta.logical_type.type.startswith("DECIMAL"):
                     logger.debug(f"[ParquetFIFOReader] [Issue174] Skipping pruning for decimal column {col_name}")
                     continue
@@ -304,7 +344,7 @@ class ParquetFIFOReader:
         return self.rank_num_rowgroups # the local RGs to handle in this world rank
         
     def get_total_num_rowgroups(self) -> int:
-        return self.meta.num_rowgroups() # the total&global number of RGs in the file
+        return len(self.rg_sources) # the total&global number of RGs across all part files
 
     @torch.inference_mode()
     def thread_read_producer(self, rg_idx: int):
@@ -324,12 +364,13 @@ class ParquetFIFOReader:
         try:
             torch.cuda.nvtx.range_push(f"RG_IDX={rg_idx} {self.table_name} RG={self.rank_rowgroups[rg_idx]}")
             rg = self.rank_rowgroups[rg_idx]
+            part_file, metadata_ptr, _, local_rg = self.rg_sources[rg]
             options = plc.io.parquet.ParquetReaderOptions.builder(
-                plc.io.SourceInfo([self.parquet_file])
+                plc.io.SourceInfo([part_file])
             ).build()
-            options.set_row_groups([[rg]])
+            options.set_row_groups([[local_rg]])
             options.set_columns(self.column_names)
-            options.set_aggregate_reader_metadata(self.metadata_ptr)
+            options.set_aggregate_reader_metadata(metadata_ptr)
             first_read = first_read_begin() # FlowCSD observation: one-time libcudf initialization happens in the first call
             plc_table_w_meta = plc.io.parquet.read_parquet(options, th_stream)
             if first_read:
@@ -517,7 +558,7 @@ class ParquetFIFOReader:
         return self._finished
     
     def get_num_rowgroups(self) -> int:
-        return self.meta.num_rowgroups()
+        return len(self.rg_sources)
     
     def get_rank_num_rowgroups(self) -> int:
         return self.rank_num_rowgroups
